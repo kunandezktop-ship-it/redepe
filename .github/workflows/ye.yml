@@ -1,0 +1,172 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure Core RDP Settings
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+
+          Restart-Service -Name TermService -Force
+
+      - name: Disable Hyper-V Components (Safe Mode)
+        run: |
+          echo "Disabling Hyper-V related features safely..."
+
+          $features = @(
+              "HypervisorPlatform",
+              "VirtualMachinePlatform",
+              "Containers",
+              "HostGuardian"
+          )
+
+          foreach ($feature in $features) {
+              $exists = (dism /online /get-features | findstr /i $feature)
+
+              if ($exists) {
+                  echo "Disabling: $feature"
+                  dism /online /disable-feature /featurename:$feature /norestart
+              } else {
+                  echo "Skipping nonexistent feature: $feature"
+              }
+          }
+
+          echo "Hyper-V disable completed safely."
+          exit 0
+
+      - name: Enable GPU Acceleration + Roblox Compatibility
+        run: |
+          echo "Enabling GPU acceleration registry tweaks..."
+
+          # Enable hardware accelerated GPU scheduling
+          reg add "HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers" /v HwSchMode /t REG_DWORD /d 2 /f
+
+          # Enable WARP GPU fallback
+          reg add "HKLM\SOFTWARE\Microsoft\Direct3D" /v WarpUseHardware /t REG_DWORD /d 1 /f
+
+          # Enable OpenGL compatibility
+          reg add "HKLM\SOFTWARE\Microsoft\Windows\Dwm" /v EnableOpenGL /t REG_DWORD /d 1 /f
+
+          # Roblox fix: force D3D11 instead of D3D12
+          reg add "HKCU\Software\Roblox\RobloxStudioBrowser" /v D3DCompilerFix /t REG_DWORD /d 1 /f
+
+          echo "GPU tweaks applied!"
+
+      - name: Install Required Runtimes for Roblox
+        run: |
+          echo "Installing prerequisites..."
+
+          # DirectX runtime
+          Invoke-WebRequest -Uri "https://download.microsoft.com/download/1/1/2/1122BB96-34A6-4F46-8D79-26F7C9D3F88E/dxwebsetup.exe" -OutFile dx.exe
+          Start-Process .\dx.exe -ArgumentList "/Q" -Wait
+
+          # VC++ 2015-2022 x64
+          Invoke-WebRequest -Uri "https://aka.ms/vs/17/release/vc_redist.x64.exe" -OutFile vcredist_x64.exe
+          Start-Process .\vcredist_x64.exe -ArgumentList "/install /quiet /norestart" -Wait
+
+          # VC++ 2015-2022 x86
+          Invoke-WebRequest -Uri "https://aka.ms/vs/17/release/vc_redist.x86.exe" -OutFile vcredist_x86.exe
+          Start-Process .\vcredist_x86.exe -ArgumentList "/install /quiet /norestart" -Wait
+
+          # WebView2
+          Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/p/?LinkId=2124703" -OutFile webview.exe
+          Start-Process .\webview.exe -ArgumentList "/silent /install" -Wait
+
+          echo "All runtimes installed!"
+
+      - name: Install Roblox Player
+        run: |
+          echo "Installing Roblox..."
+
+          Invoke-WebRequest -Uri "https://setup.rbxcdn.com/Roblox.exe" -OutFile Roblox.exe
+          Start-Process .\Roblox.exe -ArgumentList "-install -quiet" -Wait
+
+          echo "Roblox installed!"
+
+      - name: Create RDP User with Secure Password
+        run: |
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126))
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
+
+      - name: Maintain Connection
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "==================`n"
+          
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
+          }
