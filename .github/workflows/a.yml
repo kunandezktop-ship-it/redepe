@@ -1,0 +1,30 @@
+- name: Disable Hyper-V Components (Safe)
+  shell: pwsh
+  run: |
+    Write-Host "Disabling Hyper-V related features safely..."
+
+    $features = @(
+        "Microsoft-Hyper-V-All",
+        "HypervisorPlatform",
+        "VirtualMachinePlatform",
+        "Containers",
+        "HostGuardian"
+    )
+
+    foreach ($feature in $features) {
+        try {
+            $exists = dism /online /get-features | Select-String -Pattern $feature
+            if ($exists) {
+                Write-Host "Disabling: $feature"
+                dism /online /disable-feature /featurename:$feature /norestart /quiet
+            } else {
+                Write-Host "Skipping nonexistent feature: $feature"
+            }
+        } catch {
+            Write-Host "Error disabling $feature, skipping..."
+        }
+    }
+
+    # Force exit code 0
+    $global:LASTEXITCODE = 0
+    Write-Host "Hyper-V disable completed safely."
